@@ -26,6 +26,48 @@ function loadFromStorage() {
   catch { return []; }
 }
 
+// Helper: fetch all paginated (cursor-based) results for a resource
+async function fetchAllCursor(endpoint, objectKey) {
+  let data = [];
+  let cursor = undefined;
+  let hasNext = true;
+  while (hasNext) {
+    let url = endpoint + (cursor ? (endpoint.includes('?') ? '&' : '?') + `after=${encodeURIComponent(cursor)}` : "");
+    const resp = await fetch(url);
+    const body = await resp.json();
+    const arr = (body?.[objectKey]?.data) || [];
+    data.push(...arr);
+    hasNext = body?.[objectKey]?.meta?.has_next_page;
+    cursor = body?.[objectKey]?.meta?.end_cursor;
+    if (!hasNext) break;
+  }
+  return data;
+}
+// Helper: fetch all offset-based (limit/offset) collections
+async function fetchAllOffset(endpoint, objectKey) {
+  let data = [];
+  let offset = 0; 
+  let limit = 100;
+  while (true) {
+    const url = `${endpoint}${endpoint.includes('?') ? '&' : '?'}offset=${offset}&limit=${limit}`;
+    const resp = await fetch(url);
+    const body = await resp.json();
+    const arr = (body?.[objectKey]?.data) || [];
+    data.push(...arr);
+    if (!arr.length || arr.length < limit) break;
+    offset += limit;
+  }
+  return data;
+}
+
+// Helper: for record creation: flatten site/project/post objects to a common format
+function extractProjectDetail(item) {
+  return item.project || item;
+}
+function extractSiteDetail(item) {
+  return item.site || item;
+}
+
 // Main async chain
 (async function main() {
   statusEl.innerHTML = `<span class="spinner"></span> Fetching user details...`;
@@ -42,24 +84,70 @@ function loadFromStorage() {
   }
   statusEl.innerHTML = `User: <img src="https://images.websim.ai/avatar/${user.username}" style="border-radius:100%;width:2em;vertical-align:middle" /> <b>@${user.username}</b> — Fetching all public metadata...`;
 
-  // Aggregate everything we can: likes, projects, sites, following, followers, stats...
+  // Use robust "fetch all" patterns for each resource
   let [
-    likesResp, projectsResp, sitesResp, followersResp, followingResp, statsResp
-  ] = await Promise.allSettled([
-    fetch(`/api/v1/users/${user.username}/likes?first=1000&last=0`).then(r => r.json()),
-    fetch(`/api/v1/users/${user.username}/projects?first=1000&last=0`).then(r => r.json()),
-    fetch(`/api/v1/users/${user.username}/sites?first=1000&last=0`).then(r => r.json()),
-    fetch(`/api/v1/users/${user.username}/followers?first=1000&last=0`).then(r => r.json()),
-    fetch(`/api/v1/users/${user.username}/following?first=1000&last=0`).then(r => r.json()),
-    fetch(`/api/v1/users/${user.username}/stats`).then(r => r.json()).catch(()=>({})),
+    likes, projects, sites, followers, following, stats,
+    comments, commentReplies, userPosts
+  ] = await Promise.all([
+    fetchAllCursor(`/api/v1/users/${user.username}/likes?first=100`, "likes"),
+    fetchAllCursor(`/api/v1/users/${user.username}/projects?first=100`, "projects"),
+    fetchAllCursor(`/api/v1/users/${user.username}/sites?first=100`, "sites"),
+    fetchAllCursor(`/api/v1/users/${user.username}/followers?first=100`, "followers"),
+    fetchAllCursor(`/api/v1/users/${user.username}/following?first=100`, "following"),
+    fetch(`/api/v1/users/${user.username}/stats`).then(r => r.json()).then(r=>r.stats||{}).catch(()=>({})),
+
+    // For extra depth: all comments made, replies, posts, using all paginated endpoints
+    fetchAllOffset(`/api/v1/users/${user.username}/comments?limit=100`, "comments") // fallback, not always implemented
+      .catch(()=>[]),
+    fetchAllOffset(`/api/v1/users/${user.username}/comments/replies?limit=100`, "comments") // fallback, not always implemented
+      .catch(()=>[]),
+    fetchAllOffset(`/api/v1/projects/${user.id}/posts?limit=100`, "posts").catch(()=>[]), // fallback
   ]);
-  // Pull results
-  let likes = likesResp.value?.likes?.data ?? [];
-  let projects = projectsResp.value?.projects?.data ?? [];
-  let sites = sitesResp.value?.sites?.data ?? [];
-  let followers = followersResp.value?.followers?.data ?? [];
-  let following = followingResp.value?.following?.data ?? [];
-  let stats = statsResp?.value?.stats ?? {};
+  
+  // Also, for *every* user project above, fetch their posts and comments, for deeper coverage
+  let extra = {
+    projectPosts: [],
+    projectComments: [],
+    projectRevisions: [],
+    projectAssets: [],
+  };
+  for (const pj of projects) {
+    const pid = pj.project?.id || pj?.id;
+    if (!pid) continue;
+    // Posts
+    try {
+      const posts = await fetchAllOffset(`/api/v1/projects/${pid}/posts?limit=100`, "posts");
+      if (posts && posts.length) extra.projectPosts.push(...posts.map(post => ({...post, projectId: pid})));
+    } catch {}
+    // Comments
+    try {
+      const comm = await fetchAllCursor(`/api/v1/projects/${pid}/comments?first=50`, "comments");
+      if (comm && comm.length) extra.projectComments.push(...comm.map(c => ({...c, projectId: pid})));
+      // Replies
+      for (const c of comm) {
+        try {
+          const replies = await fetchAllCursor(`/api/v1/projects/${pid}/comments/${c.comment.id}/replies?first=50`, "comments");
+          if (replies && replies.length) extra.projectComments.push(...replies.map(r => ({...r, projectId: pid, parent_comment_id: c.comment.id})));
+        } catch {}
+      }
+    } catch {}
+    // Revisions
+    try {
+      const revs = await fetchAllCursor(`/api/v1/projects/${pid}/revisions?first=50`, "revisions");
+      if (revs && revs.length) extra.projectRevisions.push(...revs.map(r => ({...r, projectId: pid})));
+    } catch {}
+    // Assets
+    try {
+      if (pj.project?.current_version) {
+        let v = pj.project.current_version;
+        const assetsResp = await fetch(`/api/v1/projects/${pid}/revisions/${v}/assets`);
+        const assetsJson = await assetsResp.json();
+        if (assetsJson?.assets) {
+          extra.projectAssets.push(...assetsJson.assets.map(asset => ({...asset, projectId: pid, version: v})));
+        }
+      }
+    } catch {}
+  }
 
   let stackOfRecords = [];
 
@@ -69,8 +157,19 @@ function loadFromStorage() {
   for (const si of sites) stackOfRecords.push({ type: "own_site", ...si });
   for (const f of followers) stackOfRecords.push({ type: "follower", ...f });
   for (const f of following) stackOfRecords.push({ type: "following", ...f });
+  // Add own comments and posts (if available)
+  for (const c of comments) stackOfRecords.push({ type: "comment", ...c });
+  for (const r of commentReplies) stackOfRecords.push({ type: "comment_reply", ...r });
+  for (const p of userPosts) stackOfRecords.push({ type: "user_post", ...p });
+  // Per-project further data
+  for (const p of extra.projectPosts) stackOfRecords.push({ type: "project_post", ...p });
+  for (const p of extra.projectComments) stackOfRecords.push({ type: "project_comment", ...p });
+  for (const p of extra.projectRevisions) stackOfRecords.push({ type: "project_revision", ...p });
+  for (const a of extra.projectAssets) stackOfRecords.push({ type: "project_asset", ...a });
+  // Add stats
+  stackOfRecords.push({ type: "user_stats", stats });
 
-  // batch analyze with LLM, 5-8 at a time for scoring/insights, then overall
+  // batch analyze with LLM, 8 at a time for scoring/insights, then overall
   statusEl.innerHTML = `<span class="spinner"></span> Analyzing ${stackOfRecords.length} records for research insights via AI...`;
 
   // For each stack chunk, use the LLM to get a "score" and info
@@ -87,25 +186,33 @@ function loadFromStorage() {
       if (t === "own_site") return `Site: "${rec.site?.title||'Untitled'}"`;
       if (t === "follower") return `Follower: @${rec.follow?.user?.username||"?"}`;
       if (t === "following") return `Following: @${rec.follow?.user?.username||"?"}`;
+      if (t === "comment") return `Comment: "${rec.comment?.content?.children?.[0]?.children?.[0]?.text?.slice(0,48) || "..."}`; 
+      if (t === "comment_reply") return `Comment Reply: "${rec.comment?.content?.children?.[0]?.children?.[0]?.text?.slice(0,48) || "..."}"`;
+      if (t === "user_post") return `User Post: type ${rec.post?.type || rec.type}`;
+      if (t === "project_post") return `Project Post: ${rec.type} (projectId ${rec.projectId})`;
+      if (t === "project_comment") return `Project Comment (in project ${rec.projectId})`;
+      if (t === "project_revision") return `Project Revision: v${rec.project_revision?.version || "(?)"} of ${rec.projectId}`;
+      if (t === "project_asset") return `Project Asset: ${rec.meta?.title || rec.path || 'asset'} (project ${rec.projectId})`;
+      if (t === "user_stats") return `UserStats: ${JSON.stringify(rec.stats)}`;
       return `Other: ${JSON.stringify(rec).slice(0,80)}`;
     });
 
     // Use LLM to judge/describe/score this batch (system prompt: be analytical, help for self-improvement, assign an "interest" score)
-    const llmRes = await window.websim.chat.completions.create({
-      messages: [
-        {
-          role: "system",
-          content: "You are an expert researcher. For each item below, score its 'interest for working on' (1-10, higher=better to work on now), provide a concise reason, and a one-line suggestion. Format as JSON: [{score, title, reason, suggestion}].",
-        },
-        {
-          role: "user",
-          content: dataForBatch.join('\n')
-        }
-      ],
-      json: true
-    });
-    let resultsForChunk;
+    let llmRes, resultsForChunk;
     try {
+      llmRes = await window.websim.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content: "You are an expert researcher. For each item below, score its 'interest for working on' (1-10, higher=better to work on now), provide a concise reason, and a one-line suggestion. Format as JSON: [{score, title, reason, suggestion}].",
+          },
+          {
+            role: "user",
+            content: dataForBatch.join('\n')
+          }
+        ],
+        json: true
+      });
       resultsForChunk = JSON.parse(llmRes.content);
       if (!Array.isArray(resultsForChunk)) throw new Error("LLM returned invalid JSON");
     } catch (e) {
@@ -175,6 +282,24 @@ function renderResults() {
       title = `<b>Follower:</b> @${rec.follow?.user?.username}`;
     } else if (rec.type === "following") {
       title = `<b>Following:</b> @${rec.follow?.user?.username}`;
+    } else if (rec.type === "comment") {
+      const txt = rec.comment?.content?.children?.map(n => n.children?.map(t => t.text).join(' ')).join(' ').slice(0, 64);
+      title = `<b>Comment:</b> ${txt || "..."}`;
+    } else if (rec.type === "comment_reply") {
+      const txt = rec.comment?.content?.children?.map(n => n.children?.map(t => t.text).join(' ')).join(' ').slice(0, 64);
+      title = `<b>Comment Reply:</b> ${txt || "..."}`;
+    } else if (rec.type === "user_post") {
+      title = `<b>User Post:</b> type ${(rec.post?.type) || rec.type}`;
+    } else if (rec.type === "project_post") {
+      title = `<b>Project Post:</b> ${rec.type} (projectId ${rec.projectId})`;
+    } else if (rec.type === "project_comment") {
+      title = `<b>Project Comment:</b> in project ${rec.projectId}`;
+    } else if (rec.type === "project_revision") {
+      title = `<b>Project Revision:</b> v${rec.project_revision?.version || "(?)"} of ${rec.projectId}`;
+    } else if (rec.type === "project_asset") {
+      title = `<b>Project Asset:</b> ${rec.meta?.title || rec.path || 'asset'} (project ${rec.projectId})`;
+    } else if (rec.type === "user_stats") {
+      title = `<b>User Stats:</b> ${Object.entries(rec.stats||{}).map(([k,v])=>`${k}: ${v}`).join(", ")}`;
     } else {
       title = `<b>[?]</b> ${JSON.stringify(rec).slice(0,80)}`;
     }
@@ -246,4 +371,3 @@ async function runDecisionLLM() {
   llmDecisionFeedback.innerHTML = `<strong>LLM says:</strong><br><div style="white-space: pre-line">${res.content}</div>`;
   decideBtn.disabled = false;
 }
-
